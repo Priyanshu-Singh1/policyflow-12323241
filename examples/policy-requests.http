@@ -1,0 +1,254 @@
+### ==============================================================================
+### POLICYFLOW API EVALUATION & FAILURE-INJECTION DEMO
+### Base URL: http://localhost:8000
+### ==============================================================================
+
+@baseUrl = http://localhost:8000/api
+@agentId = AGENT-17
+@clientRequestId = AGT-2026-DEMO-01
+
+### ------------------------------------------------------------------------------
+### 1. INTAKE: Create a new policy request (HTTP 201 Created)
+### Deterministic formula verification:
+### DOB: 1998-04-10 (age 28 on trip_start 2026-11-10 -> age multiplier 1.00)
+### Trip: 2026-11-10 to 2026-11-14 (inclusive 5 days)
+### Plan: PLUS (₹20/day) | Dest: INTERNATIONAL (1.80) | Sum Insured: ₹300,000 (1.25)
+### Expected Premium: 20 * 5 * 1.00 * 1.80 * 1.25 = ₹225.00
+### ------------------------------------------------------------------------------
+# @name createPolicy
+POST {{baseUrl}}/policy-requests
+Content-Type: application/json
+Accept: application/json
+
+{
+  "client_request_id": "{{clientRequestId}}",
+  "agent_id": "{{agentId}}",
+  "customer_name": "Sample Customer",
+  "date_of_birth": "1998-04-10",
+  "destination": "INTERNATIONAL",
+  "trip_start": "2026-11-10",
+  "trip_end": "2026-11-14",
+  "plan_code": "PLUS",
+  "sum_insured": 300000
+}
+
+### Capture policyId from response
+@policyId = {{createPolicy.response.body.data.id}}
+
+### ------------------------------------------------------------------------------
+### 2. RELIABILITY CASE A: Duplicate Intake (HTTP 200 OK Idempotent Return)
+### Submitting identical agent_id + client_request_id returns the existing record
+### without recalculating premium or duplicating database rows.
+### ------------------------------------------------------------------------------
+POST {{baseUrl}}/policy-requests
+Content-Type: application/json
+Accept: application/json
+
+{
+  "client_request_id": "{{clientRequestId}}",
+  "agent_id": "{{agentId}}",
+  "customer_name": "Sample Customer",
+  "date_of_birth": "1998-04-10",
+  "destination": "INTERNATIONAL",
+  "trip_start": "2026-11-10",
+  "trip_end": "2026-11-14",
+  "plan_code": "PLUS",
+  "sum_insured": 300000
+}
+
+### ------------------------------------------------------------------------------
+### 3. VALIDATION REJECTION: Invalid travel dates (HTTP 422 Unprocessable Entity)
+### ------------------------------------------------------------------------------
+POST {{baseUrl}}/policy-requests
+Content-Type: application/json
+Accept: application/json
+
+{
+  "client_request_id": "AGT-INVALID-01",
+  "agent_id": "{{agentId}}",
+  "customer_name": "Invalid Customer",
+  "date_of_birth": "1998-04-10",
+  "destination": "INTERNATIONAL",
+  "trip_start": "2026-11-14",
+  "trip_end": "2026-11-10",
+  "plan_code": "PLUS",
+  "sum_insured": 300000
+}
+
+### ------------------------------------------------------------------------------
+### 4. RETRIEVE POLICY & AUDIT TRAIL: Query details by ID (HTTP 200 OK)
+### ------------------------------------------------------------------------------
+GET {{baseUrl}}/policy-requests/{{policyId}}
+Accept: application/json
+
+### ------------------------------------------------------------------------------
+### 5. ISSUANCE: Standard Happy Path (HTTP 200 OK -> ISSUED)
+### External insurer issues policy with unique policy_number (POL-XXXXXXXX)
+### ------------------------------------------------------------------------------
+POST {{baseUrl}}/policy-requests/{{policyId}}/submit
+Content-Type: application/json
+Accept: application/json
+X-Mock-Scenario: SUCCESS
+
+### ------------------------------------------------------------------------------
+### 6. STATE MACHINE TERMINAL PROTECTION: Attempt to re-submit ISSUED policy
+### Rejected with HTTP 409 Conflict. Cannot regress or mutate terminal state.
+### ------------------------------------------------------------------------------
+POST {{baseUrl}}/policy-requests/{{policyId}}/submit
+Content-Type: application/json
+Accept: application/json
+X-Mock-Scenario: SUCCESS
+
+### ==============================================================================
+### STANDOUT FEATURE: FAILURE-INJECTION DEMO (TIMEOUT & RECONCILIATION - CASE B)
+### ==============================================================================
+
+### Step 7.1: Create fresh request for timeout demo
+# @name createTimeoutPolicy
+POST {{baseUrl}}/policy-requests
+Content-Type: application/json
+Accept: application/json
+
+{
+  "client_request_id": "AGT-2026-TIMEOUT-DEMO",
+  "agent_id": "{{agentId}}",
+  "customer_name": "Timeout Demo Customer",
+  "date_of_birth": "1990-01-01",
+  "destination": "DOMESTIC",
+  "trip_start": "2026-12-01",
+  "trip_end": "2026-12-05",
+  "plan_code": "BASIC",
+  "sum_insured": 100000
+}
+
+@timeoutPolicyId = {{createTimeoutPolicy.response.body.data.id}}
+
+### Step 7.2: Trigger TIMEOUT_AFTER_ISSUE scenario
+### Insurer issues policy internally, but connection times out (HTTP 504 Gateway Timeout).
+### Policy status transitions to NEEDS_RECONCILIATION.
+# @name submitTimeout
+POST {{baseUrl}}/policy-requests/{{timeoutPolicyId}}/submit
+Content-Type: application/json
+Accept: application/json
+X-Mock-Scenario: TIMEOUT_AFTER_ISSUE
+
+@providerRef = {{submitTimeout.response.body.provider_reference}}
+
+### Step 7.3: Prove the mock insurer already holds the policy internally
+GET {{baseUrl}}/mock-insurer/policies/{{providerRef}}
+Accept: application/json
+
+### Step 7.4: Reconcile the request
+### Directly solves the assignment failure mode: recovers the existing policy number
+### without triggering duplicate issuance or second provider call (HTTP 200 OK -> ISSUED).
+POST {{baseUrl}}/policy-requests/{{timeoutPolicyId}}/reconcile
+Accept: application/json
+
+### Step 7.5: Verify policy is now ISSUED with the recovered policy number
+GET {{baseUrl}}/policy-requests/{{timeoutPolicyId}}
+Accept: application/json
+
+### ==============================================================================
+### 8. TEMPORARY FAILURE & CONTROLLED RETRY
+### ==============================================================================
+
+### Step 8.1: Create request for temporary failure demo
+# @name createTempFailPolicy
+POST {{baseUrl}}/policy-requests
+Content-Type: application/json
+Accept: application/json
+
+{
+  "client_request_id": "AGT-2026-TEMPFAIL",
+  "agent_id": "{{agentId}}",
+  "customer_name": "Retry Demo Customer",
+  "date_of_birth": "1988-06-15",
+  "destination": "DOMESTIC",
+  "trip_start": "2026-12-10",
+  "trip_end": "2026-12-15",
+  "plan_code": "PLUS",
+  "sum_insured": 300000
+}
+
+@tempFailPolicyId = {{createTempFailPolicy.response.body.data.id}}
+
+### Step 8.2: Submit with TEMPORARY_FAILURE (HTTP 503 Service Unavailable -> FAILED)
+POST {{baseUrl}}/policy-requests/{{tempFailPolicyId}}/submit
+Content-Type: application/json
+Accept: application/json
+X-Mock-Scenario: TEMPORARY_FAILURE
+
+### Step 8.3: Safe retry with SUCCESS (HTTP 200 OK -> ISSUED with original snapshot)
+POST {{baseUrl}}/policy-requests/{{tempFailPolicyId}}/submit
+Content-Type: application/json
+Accept: application/json
+X-Mock-Scenario: SUCCESS
+
+### ==============================================================================
+### 9. ASYNC ISSUANCE & DUPLICATE CALLBACK DEDUPLICATION
+### ==============================================================================
+
+### Step 9.1: Create async request
+# @name createAsyncPolicy
+POST {{baseUrl}}/policy-requests
+Content-Type: application/json
+Accept: application/json
+
+{
+  "client_request_id": "AGT-2026-ASYNC",
+  "agent_id": "{{agentId}}",
+  "customer_name": "Async Callback Customer",
+  "date_of_birth": "1994-08-22",
+  "destination": "DOMESTIC",
+  "trip_start": "2026-11-20",
+  "trip_end": "2026-11-25",
+  "plan_code": "BASIC",
+  "sum_insured": 100000
+}
+
+@asyncPolicyId = {{createAsyncPolicy.response.body.data.id}}
+
+### Step 9.2: Submit with DELAYED_CALLBACK (HTTP 202 Accepted -> PENDING_CONFIRMATION)
+# @name submitAsync
+POST {{baseUrl}}/policy-requests/{{asyncPolicyId}}/submit
+Content-Type: application/json
+Accept: application/json
+X-Mock-Scenario: DELAYED_CALLBACK
+
+@asyncProviderRef = {{submitAsync.response.body.data.provider_reference}}
+
+### Step 9.3: First Callback Delivery (HTTP 200 OK -> PROCESSED, moves to ISSUED)
+POST {{baseUrl}}/mock-insurer/callback
+Content-Type: application/json
+Accept: application/json
+
+{
+  "event_id": "EVT-MANUAL-CB-001",
+  "provider_reference": "{{asyncProviderRef}}",
+  "event_type": "POLICY_ISSUED",
+  "policy_number": "POL-CALLBACK-7777"
+}
+
+### Step 9.4: Repeated Callback Delivery (HTTP 200 OK -> DUPLICATE_IGNORED)
+POST {{baseUrl}}/mock-insurer/callback
+Content-Type: application/json
+Accept: application/json
+
+{
+  "event_id": "EVT-MANUAL-CB-001",
+  "provider_reference": "{{asyncProviderRef}}",
+  "event_type": "POLICY_ISSUED",
+  "policy_number": "POL-CALLBACK-7777"
+}
+
+### ==============================================================================
+### 10. OPERATIONS & MONITORING ENDPOINTS
+### ==============================================================================
+
+### Summary metrics and policies needing reconciliation (HTTP 200 OK)
+GET {{baseUrl}}/operations/summary
+Accept: application/json
+
+### List policies with filtering and pagination
+GET {{baseUrl}}/policy-requests?status=ISSUED&per_page=10
+Accept: application/json
